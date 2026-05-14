@@ -1,0 +1,6 @@
+numpy>=1.26
+matplotlib>=3.7
+pytest>=7.4
+# GPU support: install separately depending on CUDA version
+# pip install cupy-cuda12x   # for CUDA 12.x
+# pip install cupy-cuda11x   # for CUDA 11.x
