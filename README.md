@@ -56,14 +56,20 @@ Benchmark configuration: N=256 subcarriers, L=16 paths, complex64.
 
 | Batch size | CPU (sym/s) | GPU (sym/s) | Speedup |
 |-----------:|------------:|------------:|--------:|
-| 16         | reported by `benchmarks/throughput.py` |
-| 256        | "        |
-| 4096       | "        |
-| 16384      | "        |
+| 16         | 1.03 × 10⁵  | TBD         | –       |
+| 256        | 2.01 × 10⁵  | TBD         | –       |
+| 4096       | 2.08 × 10⁵  | TBD         | –       |
+| 16384      | 1.93 × 10⁵  | TBD         | –       |
 
-Run `python -m benchmarks.throughput` on your own hardware to populate the
-table for your specific GPU. On an A100 / RTX 4090, expect ≥ 30× speedup at
-batch ≥ 1024.
+CPU figures measured on a 2-core x86_64 host (no GPU). To populate the GPU
+column on your own hardware:
+
+```bash
+pip install cupy-cuda12x   # match your CUDA version
+python -m benchmarks.throughput
+```
+
+On A100 / RTX 4090, expect ≥ 30× speedup at batch ≥ 1024.
 
 ---
 
