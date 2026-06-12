@@ -166,7 +166,3 @@ Wiener interpolation, MIMO, and doubly-selective (Kalman) tracking.
 
 MIT.
 
-## Author
-
-Wendenda Nathanael Kaboré — PhD candidate, Electronic Engineering, National
-Taipei University of Technology. AI-native wireless systems, multi-agent deep RL, 6G.
