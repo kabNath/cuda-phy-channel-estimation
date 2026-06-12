@@ -1,0 +1,15 @@
+name: cuda
+
+on: [push, pull_request]
+
+jobs:
+  cuda-compile-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nvcc + CUDA dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nvidia-cuda-toolkit
+      - name: Compile-check the CUDA case study (no GPU needed)
+        run: make -C csrc compile-check ARCH=sm_75

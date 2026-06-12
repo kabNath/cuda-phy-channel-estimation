@@ -36,3 +36,8 @@ dist/
 .env
 .env.local
 *.key
+
+# build artifacts
+csrc/mmse_apply
+csrc/*.o
+*.ncu-rep

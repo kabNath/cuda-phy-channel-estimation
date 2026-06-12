@@ -1,236 +1,172 @@
 # cuda-phy-channel-estimation
 
-**GPU-accelerated MMSE channel estimation for OFDM-based 6G PHY**
+**A CUDA kernel-optimization case study on the inner loop of MMSE channel estimation.**
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-7%2F7%20passing-brightgreen)](tests/)
+[![cuda](https://github.com/kabNath/cuda-phy-channel-estimation/actions/workflows/cuda.yml/badge.svg)](https://github.com/kabNath/cuda-phy-channel-estimation/actions/workflows/cuda.yml)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-A clean, reference implementation of OFDM channel estimation with both CPU
-(NumPy) and GPU (CuPy) backends, designed as a building block for AI-native
-6G physical-layer pipelines.
+Channel estimation is the most-frequently-executed signal-processing step in a
+5G/6G receiver — every coherence interval, for every user and antenna. Once the
+Wiener matrix `W = R_HH (R_HH + σ²I)⁻¹` is precomputed, the hot path is simply
+applying it to a fresh batch of LS estimates:
+
+```
+H_mmse = W · H_ls,   W ∈ C^{N×N},   H_ls ∈ C^{N×B}
+```
+
+a **batched complex GEMM**. This repo takes that one operation and walks the
+canonical GPU optimization path — **naive → shared-memory tiled → cuBLAS** —
+on an RTX 4090, then explains the result with the memory hierarchy. The goal is
+to show kernel-engineering and profiling judgment, not to claim a novel kernel.
+
+> Part of a three-repo set. The end-to-end AI-RAN PHY system (real CUDA MMSE +
+> Sionna 5G BLER link + PPO/OLLA link adaptation) lives in
+> **[gpu-accelerated-ai-ran-phy-lab](https://github.com/kabNath/gpu-accelerated-ai-ran-phy-lab)**.
+> This repo is the *GPU-kernel deep-dive* that sits underneath it.
 
 ---
 
-## Why this exists
+## The optimization journey (RTX 4090, sm_89, CUDA 12.8)
 
-Channel estimation is the single most-frequently-executed signal-processing
-operation in a 5G/6G receiver: every coherence interval, for every user,
-every receive antenna. Pushing it to the GPU is one of the load-bearing ideas
-of [NVIDIA Aerial cuPHY](https://developer.nvidia.com/aerial-sdk) and of the
-broader O-RAN ML-on-GPU movement.
+`./mmse_apply --bench --N 256 --B 4096 --iters 50`, complex64:
 
-This repository:
+| variant | ms/call | GFLOP/s | speedup vs naive |
+|---|---:|---:|---:|
+| v0 naive (1 thread/output) | 0.122 | 17 623 | 1.00× |
+| v1 tiled (shared memory)   | 0.107 | 20 168 | 1.14× |
+| v2 cuBLAS cgemm            | 0.049 | 44 132 | **2.50×** |
 
-1. Implements the **Linear MMSE estimator** of Edfors et al. (1998) in a form
-   compatible with batched GPU execution.
-2. Provides a **CPU↔GPU benchmark harness** so the speedup story can be
-   reproduced on any machine with CuPy installed.
-3. Keeps the math and the engineering separate enough that the same code can
-   serve as the inner-loop primitive of a larger DRL-based link-adaptation
-   agent (see *Roadmap*).
+Two things stand out — and both *are* the point of the study:
 
----
+**1. The naive kernel already hits ~17.6 TFLOP/s (~21 % of the 4090's FP32 peak),
+and shared-memory tiling only improves it 1.14×.** That is not a failed
+optimization — it is a property of the hardware. At N=256 the Wiener matrix `W`
+is 256²·8 B = **512 KB** and the `H_ls`/`H_mmse` batches are 8 MB each, so the
+whole working set fits inside the 4090's **72 MB L2 cache**. The naive kernel's
+repeated reads of `W` and `H_ls` are therefore served from L2, not DRAM — so it
+is *not* the bandwidth-bound kernel the textbook assumes, and tiling (whose job
+is to cut DRAM traffic) has little to cut. On large-cache Ada/Hopper GPUs the
+classic naive→tiled win shrinks for cache-resident problems.
 
-## Results
+**2. cuBLAS still wins 2.5× — but through compute scheduling, not bandwidth:**
+vectorized complex MMA, register/shared-memory blocking, and arch-tuned tile
+shapes that keep the SMs busier and hide latency better than a straightforward
+tiled kernel.
 
-### MMSE vs LS — empirical MSE vs SNR
-
-![MSE vs SNR](docs/mse_vs_snr.png)
-
-| SNR (dB) | MSE LS | MSE MMSE | Gain |
-|----------|--------|----------|------|
-| 0        | 9.92e-1 | 1.02e-1 | **9.88 dB** |
-| 10       | 1.00e-1 | 1.22e-2 | **9.14 dB** |
-| 20       | 9.96e-3 | 1.24e-3 | **9.04 dB** |
-| 30       | 1.01e-3 | 1.27e-4 | **9.00 dB** |
-
-The MMSE estimator delivers a consistent ~9 dB gain over LS, which matches the
-theoretical bound `10·log10(N/L) = 9.03 dB` for N=64 subcarriers and L=8 paths.
-The LS curve overlays the analytical `σ²` line exactly, confirming the noise
-model is correctly implemented.
-
-### Throughput, CPU vs GPU
-
-Benchmark configuration: N=256 subcarriers, L=16 paths, complex64. CPU figures
-on a 2-core x86_64 host; GPU figures on **NVIDIA Tesla T4** (Turing,
-2nd-gen Tensor Cores, 16 GB VRAM) via Google Colab.
-
-![Throughput](docs/throughput.png)
-
-| Batch size | CPU (sym/s) | GPU (sym/s) | Speedup |
-|-----------:|------------:|------------:|--------:|
-| 16         | 8.85 × 10⁴  | 5.05 × 10⁵  | 5.7×    |
-| 64         | 1.81 × 10⁵  | 1.53 × 10⁶  | 8.4×    |
-| 256        | 2.28 × 10⁵  | 5.76 × 10⁶  | **25.2×** |
-| 1024       | 2.26 × 10⁵  | 6.84 × 10⁶  | **30.2×** |
-| 4096       | 2.29 × 10⁵  | 8.61 × 10⁶  | **37.5×** |
-| 16384      | 1.91 × 10⁵  | 5.33 × 10⁶  | 27.9×   |
-
-GPU speedup grows with batch size as kernel launch overhead amortises,
-peaking at **~37×** around batch 4096 — the operating point where the batched
-complex GEMM saturates the T4's tensor pipeline. The slight regression at
-batch 16384 is consistent with memory-bandwidth saturation on the T4's
-320 GB/s GDDR6 (the 8-MB working set per batch exceeds L2 cache).
-
-On Ampere/Hopper hardware (RTX 30/40, A100, H100) with 3rd/4th-gen Tensor
-Cores and higher memory bandwidth, the same code path is expected to scale
-to ≥ 100× speedup at large batches.
-
-**Reproduce on your own hardware:**
-
-```bash
-pip install cupy-cuda12x   # match your CUDA version
-python -m benchmarks.throughput
-```
-
-
-On A100 / RTX 4090, expect ≥ 30× speedup at batch ≥ 1024.
-
----
-
-## Mathematical model
-
-We consider one OFDM symbol with `N` subcarriers transmitted over a
-frequency-selective Rayleigh channel with `L` taps. In the frequency domain:
-
-```
-Y[k] = H[k] · X[k] + N[k],   k = 0, ..., N-1
-```
-
-with `N[k] ~ CN(0, σ²)` and `H = F_N · h_pad` where `h_pad ∈ C^N` is the
-zero-padded time-domain impulse response.
-
-**Least Squares (LS):** `H_LS = Y / X`. Unbiased, MSE = σ².
-
-**Linear MMSE:** uses the analytical correlation matrix
-
-```
-R_HH[k1, k2] = Σ_l p_l · exp(-j 2π (k1-k2) l / N)
-```
-
-with `p_l` the (exponential) power-delay profile. The MMSE weight matrix is
-
-```
-W = R_HH · (R_HH + σ² I)^(-1)
-```
-
-and the estimate is `H_MMSE = W · H_LS`. The matrix `R_HH` has rank `L < N`,
-so `W` is a soft projection onto the L-dimensional signal subspace — which is
-why MMSE rejects noise that LS cannot.
-
----
-
-## Repository layout
-
-```
-cuda-phy-channel-estimation/
-├── src/
-│   ├── channel.py            # Multipath channel generation, R_HH
-│   ├── estimators_cpu.py     # LS, MMSE (NumPy)
-│   └── estimators_gpu.py     # LS, MMSE (CuPy)
-├── benchmarks/
-│   ├── mse_vs_snr.py         # MSE vs SNR sweep
-│   └── throughput.py         # CPU vs GPU symbols/s
-├── tests/
-│   └── test_estimators.py    # 7 unit tests, all passing
-├── docs/
-│   ├── mse_vs_snr.png
-│   └── throughput.png
-└── README.md
-```
-
----
+The takeaway is engineering judgment: check working-set vs cache size *before*
+reaching for a textbook optimization, and know when the right move is to call
+the vendor library.
 
 ## Quick start
 
 ```bash
-git clone https://github.com/<kabNath>/cuda-phy-channel-estimation.git
-cd cuda-phy-channel-estimation
-
-# CPU-only setup
-pip install -r requirements.txt
-
-# GPU setup (CUDA 12.x)
-pip install cupy-cuda12x
-
-# Run tests
-pytest tests/ -v
-
-# Reproduce the MSE plot
-python -m benchmarks.mse_vs_snr
-
-# Run the throughput benchmark
-python -m benchmarks.throughput
+make ARCH=sm_89            # sm_75 for a T4, sm_80 A100, sm_90 H100
+./mmse_apply --selftest    # correctness: all variants < 1e-3 vs CPU reference
+./mmse_apply --bench --N 256 --B 4096 --iters 50
 ```
 
----
+`--selftest` checks all three variants against a double-precision CPU reference;
+on the 4090 they agree to ~1.7e-7.
 
-## Implementation notes
+## Profiling (reproducible)
 
-- **Why precompute `W`?** The weight matrix depends only on `(R_HH, σ²)`. For a
-  receiver tracking ~100 users at SNRs binned in 1-dB intervals, a small cache
-  of precomputed `W` matrices is far cheaper than a per-symbol solve.
-- **Why `np.linalg.solve` and not `np.linalg.inv`?** Solving `(R + σ²I) X = H_LS`
-  is numerically more stable than forming the explicit inverse, especially at
-  low SNR where the matrix becomes ill-conditioned.
-- **Why `complex64` on GPU?** Complex GEMM in `complex64` maps to Tensor Cores
-  on Ampere and later. `complex128` does not, and is ~10× slower for the same
-  batch size.
-- **Limits of this model.** This is a single-symbol, all-pilot, single-antenna
-  setup. Practical receivers use comb-type pilots + 2D Wiener / Kalman
-  interpolation across time and frequency, and operate over MIMO channels.
-  Those extensions are tracked in the roadmap.
+The analysis above is a claim about the memory hierarchy, so here is how to
+verify it with **Nsight Compute** rather than take it on faith:
 
----
+```bash
+ncu --launch-count 1 --kernel-name apply_naive \
+    --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+sm__warps_active.avg.pct_of_peak_sustained_active,\
+lts__t_sector_hit_rate.pct \
+    ./csrc/mmse_apply --bench --N 256 --B 4096
+# repeat with --kernel-name apply_tiled ; cuBLAS via --kernel-name regex:".*gemm.*"
+```
 
-## Roadmap
+The prediction to check: the naive kernel shows a **high L2 hit rate** with only
+moderate DRAM throughput — the quantitative confirmation that it is L2-served,
+not DRAM-bound. `profiling/collect.sh` runs this for the two custom kernels and
+`profiling/nsight.md` documents each metric and the roofline view.
 
-- [ ] Comb-type pilot patterns with 1D/2D Wiener interpolation
-- [ ] MIMO extension (per-stream R_HH, joint estimation)
-- [ ] Doubly-selective channels — Kalman smoothing across symbols
-- [ ] Integration with [NVIDIA Sionna](https://nvlabs.github.io/sionna/) as a
-      drop-in custom layer
-- [ ] DRL link adaptation built on top of these estimates (separate repo)
+> On WSL2, GPU performance counters are gated by the Windows driver. Enable them
+> via NVIDIA Control Panel → *Developer* → *Manage GPU Performance Counters* →
+> "Allow access to all users", then `wsl --shutdown` and relaunch.
 
----
+## Why the apply step is the right thing to profile
+
+For a receiver tracking ~100 users at SNRs binned in 1-dB intervals, the Wiener
+matrices are precomputed and cached — so the *recurring* cost is the apply, not
+the solve. The matrix build (`R_HH`) and the Cholesky solve live in the Python
+reference and in the flagship repo (see **Scope**).
+
+## Estimator correctness (the statistics)
+
+The CUDA case study is validated numerically (`--selftest`). That the MMSE
+estimator achieves the theoretical `10·log₁₀(N/L)` gain over LS is shown by the
+NumPy / CuPy reference in `src/`:
+
+| SNR (dB) | MSE LS | MSE MMSE | gain |
+|---:|---:|---:|---:|
+| 0  | 9.92e-1 | 1.02e-1 | 9.88 dB |
+| 10 | 1.00e-1 | 1.22e-2 | 9.14 dB |
+| 20 | 9.96e-3 | 1.24e-3 | 9.04 dB |
+| 30 | 1.01e-3 | 1.27e-4 | 9.00 dB |
+
+For N=64, L=8 the bound is `10·log₁₀(8) = 9.03 dB` — matched across SNR.
+
+```bash
+pip install -r requirements.txt
+python -m benchmarks.mse_vs_snr
+```
+
+## Mathematical model
+
+One OFDM symbol, `N` subcarriers, frequency-selective Rayleigh channel, `L` taps.
+Frequency domain: `Y[k] = H[k]·X[k] + N[k]`, `N[k] ~ CN(0, σ²)`.
+
+- **LS:** `H_LS = Y / X` — unbiased, `MSE = σ²`.
+- **MMSE:** `W = R_HH (R_HH + σ²I)⁻¹`, `H_MMSE = W · H_LS`, with
+  `R_HH[k₁,k₂] = Σ_l p_l · exp(−j2π(k₁−k₂)l/N)`. Because `R_HH` has rank `L < N`,
+  `W` is a soft projection onto the `L`-dimensional signal subspace — which is
+  why MMSE rejects noise that LS cannot.
+
+## Repository layout
+
+```
+csrc/
+  mmse_apply.cu        # v0 naive, v1 tiled, v2 cuBLAS — the case study
+  Makefile             # build + `compile-check` (no-GPU, used by CI)
+profiling/
+  nsight.md            # exact ncu commands + which metrics to capture
+  collect.sh           # one-shot metric table for v0/v1
+src/
+  channel.py           # multipath channel, R_HH
+  estimators_cpu.py    # LS, MMSE (NumPy reference)
+  estimators_gpu.py    # LS, MMSE (CuPy reference)
+benchmarks/            # MSE-vs-SNR, CuPy throughput
+tests/                 # estimator unit tests
+.github/workflows/cuda.yml   # CI: compile-check the CUDA on every push
+```
+
+## Scope (honest limits)
+
+This profiles the **apply** kernel of a single-symbol, all-pilot, single-antenna
+estimator. Not covered here (tracked in the flagship / roadmap): the `R_HH`
+build and a batched Cholesky solve as CUDA kernels, comb-type pilots with 2-D
+Wiener interpolation, MIMO, and doubly-selective (Kalman) tracking.
 
 ## References
 
-1. O. Edfors, M. Sandell, J.-J. van de Beek, S. Wilson, P. O. Borjesson,
-   "OFDM Channel Estimation by Singular Value Decomposition,"
-   *IEEE Trans. Commun.*, vol. 46, no. 7, pp. 931–939, 1998.
-2. R. W. Heath Jr. and A. Lozano,
-   *Foundations of MIMO Communication*, Cambridge University Press, 2018.
-3. NVIDIA, *Aerial cuPHY documentation*,
-   https://developer.nvidia.com/aerial-sdk.
-4. J. Hoydis et al., "Sionna: An Open-Source Library for Next-Generation
-   Physical Layer Research," arXiv:2203.11854, 2022.
-
----
-
-## Citation
-
-If this code helps your research, please cite:
-
-```bibtex
-@misc{kabore2026cudaphy,
-  author       = {Wendenda Nathanael Kabor\'e},
-  title        = {{cuda-phy-channel-estimation}: GPU-accelerated MMSE channel
-                  estimation for OFDM-based 6G PHY},
-  year         = {2026},
-  howpublished = {\url{https://github.com/<kabNath>/cuda-phy-channel-estimation}}
-}
-```
-
----
+- O. Edfors et al., "OFDM Channel Estimation by Singular Value Decomposition,"
+  *IEEE Trans. Commun.*, 46(7), 1998.
+- NVIDIA, *Aerial cuPHY* documentation.
+- J. Hoydis et al., "Sionna," arXiv:2203.11854, 2022.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT.
 
 ## Author
 
 Wendenda Nathanael Kaboré — PhD candidate, Electronic Engineering, National
-Taipei University of Technology. Research focus: AI-native wireless systems,
-multi-agent deep RL, 6G/SAGIN.
+Taipei University of Technology. AI-native wireless systems, multi-agent deep RL, 6G.
